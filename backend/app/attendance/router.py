@@ -1,0 +1,462 @@
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+import uuid
+import secrets
+from ..database import get_db
+from ..models.user import User, UserRole
+from ..models.attendance import AttendanceSession, AttendanceRecord, SessionState, AttendanceStatus
+from ..schemas.attendance import SessionCreate, SessionResponse, AttendanceVerify, AttendanceResult
+from ..auth.dependencies import get_current_faculty, get_current_user, get_current_hod
+from ..qr.service import qr_service
+from ..schemas.academic import StudentDashboardStats, AttendanceStats, TimetableSlotResponse, LeaveRequestCreate, LeaveRequestResponse, StudentRosterItem
+from ..models.academic import Subject, Enrollment, TimetableSlot, LeaveRequest, LeaveStatus, LeaveType
+from ..gps.service import gps_service
+from ..ble.service import ble_service
+from ..validation.engine import validation_engine
+from ..models.attendance import AttendanceSession, AttendanceRecord, SessionState, AttendanceStatus, Classroom
+from ..models.announcement import Announcement
+from ..services.redis_service import redis_service
+from ..services.logger import log_validation_event, log_fraud_event
+from ..services.websocket_manager import manager
+
+router = APIRouter(prefix="/attendance", tags=["Attendance"])
+
+@router.get("/student-stats", response_model=StudentDashboardStats)
+def get_student_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Fetch all enrollments for the student
+    enrollments = db.query(Enrollment).filter(Enrollment.student_id == current_user.id).all()
+    
+    subject_stats = []
+    total_present = 0
+    total_classes = 0
+    
+    for enrollment in enrollments:
+        subject = enrollment.subject
+        # Total sessions conducted for this subject
+        sessions_conducted = db.query(AttendanceSession).filter(AttendanceSession.subject_id == subject.id).count()
+        # Present records for this student in this subject
+        present_count = db.query(AttendanceRecord).join(AttendanceSession).filter(
+            AttendanceRecord.student_id == current_user.id,
+            AttendanceSession.subject_id == subject.id,
+            AttendanceRecord.status == AttendanceStatus.PRESENT
+        ).count()
+        
+        percentage = (present_count / sessions_conducted * 100) if sessions_conducted > 0 else 100.0
+        
+        status = "SAFE"
+        if percentage < 75:
+            status = "CRITICAL"
+        elif percentage < 85:
+            status = "WARNING"
+            
+        subject_stats.append(AttendanceStats(
+            subject_id=subject.id,
+            subject_name=subject.name,
+            subject_code=subject.code,
+            total_classes=sessions_conducted,
+            present_count=present_count,
+            attendance_percentage=round(percentage, 2),
+            status=status
+        ))
+        
+        total_present += present_count
+        total_classes += sessions_conducted
+        
+    overall_percentage = (total_present / total_classes * 100) if total_classes > 0 else 100.0
+    
+    # Simple prediction logic
+    prediction = "You are doing great! Keep it up."
+    if overall_percentage < 75:
+        # Simplified prediction: (0.75 * total_classes - total_present) / (1 - 0.75)
+        # Assuming we want to reach 75%
+        needed = int((0.75 * total_classes - total_present) / 0.25) if total_classes > 0 else 0
+        prediction = f"You need to attend approximately {max(0, needed)} more classes to reach 75%."
+
+    return StudentDashboardStats(
+        overall_attendance=round(overall_percentage, 2),
+        subject_stats=subject_stats,
+        prediction=prediction
+    )
+
+@router.get("/timetable", response_model=List[TimetableSlotResponse])
+def get_timetable(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Fetch timetable slots for subjects the student is enrolled in
+    slots = db.query(TimetableSlot).join(Subject).join(Enrollment).filter(
+        Enrollment.student_id == current_user.id
+    ).all()
+    
+    # Map to response schema
+    result = []
+    for slot in slots:
+        classroom = db.query(Classroom).filter(Classroom.id == slot.classroom_id).first()
+        result.append(TimetableSlotResponse(
+            id=slot.id,
+            subject_name=slot.subject.name,
+            subject_code=slot.subject.code,
+            day_of_week=slot.day_of_week,
+            start_time=slot.start_time,
+            end_time=slot.end_time,
+            room_name=classroom.room_name if classroom else "Unknown"
+        ))
+    return result
+
+@router.post("/leave-request", response_model=LeaveRequestResponse)
+def apply_leave(
+    leave_in: LeaveRequestCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    new_request = LeaveRequest(
+        student_id=current_user.id,
+        leave_type=leave_in.leave_type,
+        start_date=leave_in.start_date,
+        end_date=leave_in.end_date,
+        reason=leave_in.reason,
+        document_url=leave_in.document_url
+    )
+    db.add(new_request)
+    db.commit()
+    db.refresh(new_request)
+    return new_request
+
+@router.post("/start-session", response_model=SessionResponse)
+def start_session(
+    session_in: SessionCreate, 
+    db: Session = Depends(get_db), 
+    current_faculty: User = Depends(get_current_faculty)
+):
+    # Generate unique session identifiers
+    session_token = secrets.token_urlsafe(16)
+    qr_secret = secrets.token_hex(16)
+    ble_uuid = str(uuid.uuid4())
+    
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=session_in.duration_mins)
+    
+    new_session = AttendanceSession(
+        faculty_id=current_faculty.id,
+        classroom_id=session_in.classroom_id,
+        subject_id=session_in.subject_id, # Link session to subject
+        session_token=session_token,
+        qr_secret=qr_secret,
+        ble_uuid=ble_uuid,
+        state=SessionState.ACTIVE,
+        expires_at=expires_at
+    )
+    
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
+    
+    return new_session
+
+@router.post("/verify", response_model=AttendanceResult)
+def verify_attendance(
+    verify_in: AttendanceVerify, 
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db), 
+    current_user: User = Depends(get_current_user)
+):
+    # 1. Fetch Session
+    session = db.query(AttendanceSession).filter(
+        AttendanceSession.session_token == verify_in.session_token,
+        AttendanceSession.state == SessionState.ACTIVE
+    ).first()
+    
+    if not session or datetime.now(timezone.utc) > session.expires_at:
+        raise HTTPException(status_code=400, detail="Attendance session is not active or expired")
+
+    # 2. Duplicate Check (Redis + DB)
+    if redis_service.is_attendance_processed(session.id, current_user.id):
+        raise HTTPException(status_code=400, detail="Attendance already marked for this session")
+
+    # 3. Validation Logic (Modular Engine)
+    classroom = db.query(Classroom).filter(Classroom.id == session.classroom_id).first()
+    
+    context = {
+        "qr_secret": session.qr_secret,
+        "lat": classroom.gps_lat if classroom else 0,
+        "long": classroom.gps_long if classroom else 0,
+        "radius": classroom.gps_radius_meters if classroom else 200,
+        "ble_uuid": session.ble_uuid
+    }
+    
+    # Prepare data for engine
+    validation_data = {
+        "qr_data": verify_in.qr_token,
+        "gps_data": {"lat": verify_in.gps_data.lat, "long": verify_in.gps_data.long} if verify_in.gps_data else None,
+        "ble_data": {"rssi": verify_in.ble_data.rssi, "teacher_uuid": verify_in.ble_data.teacher_uuid} if verify_in.ble_data else None
+    }
+    
+    validation_result = validation_engine.process(validation_data, context)
+    total_score = validation_result["total_score"]
+    breakdown = validation_result["breakdown"]
+
+    # 4. Status Determination (Threshold 80)
+    if total_score >= 80:
+        status_result = AttendanceStatus.PRESENT
+    elif total_score >= 50:
+        status_result = AttendanceStatus.FLAGGED
+    else:
+        status_result = AttendanceStatus.ABSENT
+    
+    # 5. Store Record with Snapshot
+    record = AttendanceRecord(
+        student_id=current_user.id,
+        session_id=session.id,
+        qr_score=breakdown["qr"]["score"],
+        gps_score=breakdown["gps"]["score"],
+        ble_score=breakdown["ble"]["score"],
+        device_score=breakdown["device"]["score"],
+        total_score=total_score,
+        status=status_result,
+        validation_snapshot=breakdown, # Store the full breakdown as JSONB
+        gps_lat=verify_in.gps_data.lat if verify_in.gps_data else None,
+        gps_long=verify_in.gps_data.long if verify_in.gps_data else None,
+        rssi_strength=verify_in.ble_data.rssi if verify_in.ble_data else None
+    )
+    
+    db.add(record)
+    
+    # Mark as processed in Redis (Idempotency)
+    redis_service.mark_attendance_processed(session.id, current_user.id)
+    
+    db.commit()
+
+    # Trigger Real-time Dashboard Update (via Background Task)
+    background_tasks.add_task(
+        manager.broadcast_session_update, 
+        str(session.id), 
+        {
+            "event": "NEW_ATTENDANCE",
+            "student_name": current_user.name,
+            "score": total_score,
+            "status": status_result,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    )
+    
+    log_validation_event("ATTENDANCE_VERIFIED", {
+        "student_id": current_user.id,
+        "session_id": session.id,
+        "score": total_score,
+        "snapshot": breakdown
+    })
+    
+    return {
+        "status": status_result,
+        "score": total_score,
+        "breakdown": {k: v["score"] for k, v in breakdown.items()}
+    }
+
+@router.get("/faculty-timetable", response_model=List[TimetableSlotResponse])
+def get_faculty_timetable(
+    db: Session = Depends(get_db),
+    current_faculty: User = Depends(get_current_faculty)
+):
+    # Fetch slots where this faculty is teaching (assuming Subject model has faculty_id or similar, 
+    # for now we'll fetch slots for subjects in the CS department as a placeholder or all subjects)
+    slots = db.query(TimetableSlot).join(Subject).all() # Simplified for now
+    
+    result = []
+    for slot in slots:
+        classroom = db.query(Classroom).filter(Classroom.id == slot.classroom_id).first()
+        result.append(TimetableSlotResponse(
+            id=slot.id,
+            subject_name=slot.subject.name,
+            subject_code=slot.subject.code,
+            day_of_week=slot.day_of_week,
+            start_time=slot.start_time,
+            end_time=slot.end_time,
+            room_name=classroom.room_name if classroom else "Unknown"
+        ))
+    return result
+
+@router.get("/current-class", response_model=Optional[TimetableSlotResponse])
+def get_current_class(
+    db: Session = Depends(get_db),
+    current_faculty: User = Depends(get_current_faculty)
+):
+    now = datetime.now()
+    current_day = now.weekday() # 0-6 (Mon-Sun)
+    current_time = now.time()
+    
+    # Find slot that matches current day and time
+    slot = db.query(TimetableSlot).filter(
+        TimetableSlot.day_of_week == current_day,
+        TimetableSlot.start_time <= current_time,
+        TimetableSlot.end_time >= current_time
+    ).first()
+    
+    if not slot: return None
+    
+    classroom = db.query(Classroom).filter(Classroom.id == slot.classroom_id).first()
+    return TimetableSlotResponse(
+        id=slot.id,
+        subject_name=slot.subject.name,
+        subject_code=slot.subject.code,
+        day_of_week=slot.day_of_week,
+        start_time=slot.start_time,
+        end_time=slot.end_time,
+        room_name=classroom.room_name if classroom else "Unknown"
+    )
+
+@router.get("/session/{session_id}/roster", response_model=List[StudentRosterItem])
+def get_session_roster(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_faculty: User = Depends(get_current_faculty)
+):
+    session = db.query(AttendanceSession).filter(AttendanceSession.id == session_id).first()
+    if not session: raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Get all students enrolled in this subject
+    enrolled_students = db.query(User).join(Enrollment).filter(Enrollment.subject_id == session.subject_id).all()
+    
+    # Get all attendance records for this session
+    records = {r.student_id: r for r in db.query(AttendanceRecord).filter(AttendanceRecord.session_id == session_id).all()}
+    
+    roster = []
+    for student in enrolled_students:
+        record = records.get(student.id)
+        roster.append(StudentRosterItem(
+            student_id=student.id,
+            name=student.name,
+            status=record.status if record else AttendanceStatus.ABSENT,
+            total_score=record.total_score if record else 0.0
+        ))
+    
+    # Sort: Present on top, then alphabetical
+    roster.sort(key=lambda x: (x.status != AttendanceStatus.PRESENT, x.name))
+    return roster
+
+@router.post("/session/{session_id}/mark-present/{student_id}")
+def mark_student_present(
+    session_id: int,
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_faculty: User = Depends(get_current_faculty)
+):
+    # Check if record exists
+    record = db.query(AttendanceRecord).filter(
+        AttendanceRecord.session_id == session_id,
+        AttendanceRecord.student_id == student_id
+    ).first()
+    
+    if record:
+        record.status = AttendanceStatus.PRESENT
+        record.total_score = 100.0 # Override
+    else:
+        record = AttendanceRecord(
+            student_id=student_id,
+            session_id=session_id,
+            status=AttendanceStatus.PRESENT,
+            total_score=100.0,
+            qr_score=100, gps_score=100, ble_score=100, device_score=100
+        )
+        db.add(record)
+    
+    db.commit()
+    return {"status": "success"}
+
+@router.post("/end-session/{session_id}")
+def end_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_faculty: User = Depends(get_current_faculty)
+):
+    session = db.query(AttendanceSession).filter(AttendanceSession.id == session_id).first()
+    if not session: raise HTTPException(status_code=404, detail="Session not found")
+    
+    session.state = SessionState.COMPLETED
+    
+    # Auto-insert ABSENT for no-shows
+    enrolled_student_ids = [e.student_id for e in db.query(Enrollment).filter(Enrollment.subject_id == session.subject_id).all()]
+    marked_student_ids = [r.student_id for r in db.query(AttendanceRecord).filter(AttendanceRecord.session_id == session_id).all()]
+    
+    missing_ids = set(enrolled_student_ids) - set(marked_student_ids)
+    for s_id in missing_ids:
+        absent_record = AttendanceRecord(
+            student_id=s_id,
+            session_id=session_id,
+            status=AttendanceStatus.ABSENT,
+            total_score=0.0
+        )
+        db.add(absent_record)
+    
+    db.commit()
+    return {"status": "session_ended"}
+
+@router.get("/leave-requests", response_model=List[LeaveRequestResponse])
+def get_hod_leave_requests(
+    status: Optional[LeaveStatus] = None,
+    db: Session = Depends(get_db),
+    current_hod: User = Depends(get_current_hod)
+):
+    query = db.query(LeaveRequest)
+    if status:
+        query = query.filter(LeaveRequest.status == status)
+    requests = query.order_by(LeaveRequest.created_at.desc()).all()
+    
+    for req in requests:
+        req.student_name = req.student.name
+    return requests
+
+@router.post("/leave-requests/{request_id}/approve")
+def approve_leave_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_hod: User = Depends(get_current_hod)
+):
+    request = db.query(LeaveRequest).filter(LeaveRequest.id == request_id).first()
+    if not request: raise HTTPException(status_code=404, detail="Request not found")
+    
+    request.status = LeaveStatus.APPROVED
+    
+    # BACKFILL ATTENDANCE
+    sessions = db.query(AttendanceSession).filter(
+        func.date(AttendanceSession.created_at) >= request.start_date,
+        func.date(AttendanceSession.created_at) <= request.end_date
+    ).all()
+    
+    for session in sessions:
+        record = db.query(AttendanceRecord).filter(
+            AttendanceRecord.session_id == session.id,
+            AttendanceRecord.student_id == request.student_id
+        ).first()
+        
+        if record:
+            record.status = AttendanceStatus.PRESENT
+            record.total_score = 100.0
+        else:
+            new_record = AttendanceRecord(
+                student_id=request.student_id,
+                session_id=session.id,
+                status=AttendanceStatus.PRESENT,
+                total_score=100.0
+            )
+            db.add(new_record)
+            
+    db.commit()
+    return {"status": "approved", "backfilled_count": len(sessions)}
+
+@router.post("/leave-requests/{request_id}/reject")
+def reject_leave_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_hod: User = Depends(get_current_hod)
+):
+    request = db.query(LeaveRequest).filter(LeaveRequest.id == request_id).first()
+    if not request: raise HTTPException(status_code=404, detail="Request not found")
+    
+    request.status = LeaveStatus.REJECTED
+    db.commit()
+    return {"status": "rejected"}
