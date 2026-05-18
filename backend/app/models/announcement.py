@@ -12,6 +12,7 @@ class Announcement(Base):
     body = Column(Text, nullable=False)
     image_url = Column(String, nullable=True) # URL path to the uploaded image
     target_subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=True) # If null, broadcast to all
+    target_role = Column(String, nullable=True) # Optional targeting (e.g. 'FACULTY', 'STUDENT')
     is_global = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

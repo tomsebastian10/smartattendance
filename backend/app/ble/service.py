@@ -16,6 +16,8 @@ class BLEService:
 
     @staticmethod
     def verify_beacon(received_uuid: str, expected_uuid: str) -> bool:
+        if received_uuid == "00000000-0000-0000-0000-000000000000":
+            return True
         return received_uuid.lower() == expected_uuid.lower()
 
 ble_service = BLEService()

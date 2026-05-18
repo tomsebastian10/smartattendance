@@ -29,6 +29,10 @@ class AttendanceSession(Base):
     state = Column(Enum(SessionState), default=SessionState.CREATED)
     started_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
+    
+    # Dynamic Geofencing
+    faculty_lat = Column(Float, nullable=True)
+    faculty_long = Column(Float, nullable=True)
 
     records = relationship("AttendanceRecord", back_populates="session")
     subject = relationship("Subject", back_populates="sessions")

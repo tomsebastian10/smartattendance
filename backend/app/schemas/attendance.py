@@ -16,6 +16,8 @@ class SessionCreate(BaseModel):
     classroom_id: int
     subject_id: int
     duration_mins: int = 60
+    lat: Optional[float] = None
+    long: Optional[float] = None
 
 class SessionResponse(BaseModel):
     id: int

@@ -67,22 +67,104 @@ class _StudentDashboardState extends State<StudentDashboard> {
       });
 
       if (mounted) {
+        final isPresent = result['status'] == 'PRESENT';
+        final isFlagged = result['status'] == 'FLAGGED';
+        
         showDialog(
           context: context,
           builder: (ctx) => AlertDialog(
-            title: const Text("Success"),
-            content: const Text("Your attendance has been recorded."),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: Row(
+              children: [
+                Icon(
+                  isPresent ? Icons.check_circle_outline : (isFlagged ? Icons.warning_amber_rounded : Icons.error_outline), 
+                  color: isPresent ? Colors.green : (isFlagged ? Colors.orange : Colors.red), 
+                  size: 24
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  isPresent ? "Success" : (isFlagged ? "Flagged" : "Absent"),
+                  style: GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 18),
+                ),
+              ],
+            ),
+            content: Text(
+              isPresent ? "Your attendance has been recorded successfully." : (isFlagged ? "Your attendance was flagged for manual review." : "Verification failed. You have been marked absent."),
+              style: GoogleFonts.inter(fontSize: 14, color: Colors.black87),
+            ),
             actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("OK"))
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  setState(() {
+                    _isVerifying = false;
+                    _progress = 0.0;
+                    _statusMessage = "Ready to Scan";
+                  });
+                },
+                child: Text(
+                  "OK",
+                  style: GoogleFonts.inter(
+                    fontWeight: FontWeight.bold,
+                    color: const Color(0xFF1E3C72),
+                  ),
+                ),
+              )
             ],
           ),
         );
       }
     } catch (e) {
+      final friendlyError = e.toString()
+          .replaceAll('Exception: ', '')
+          .replaceAll('Server Error (400): ', '');
+      
       setState(() {
-        _statusMessage = "Error: ${e.toString()}";
-        _isVerifying = false;
+        _statusMessage = "Error: $friendlyError";
+        _progress = 0.0;
       });
+
+      if (mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: Row(
+              children: [
+                const Icon(Icons.error_outline, color: Colors.red, size: 24),
+                const SizedBox(width: 8),
+                Text(
+                  "Verification Failed",
+                  style: GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 18),
+                ),
+              ],
+            ),
+            content: Text(
+              friendlyError,
+              style: GoogleFonts.inter(fontSize: 14, color: Colors.black87),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  setState(() {
+                    _isVerifying = false;
+                    _statusMessage = "Ready to Scan";
+                  });
+                },
+                child: Text(
+                  "OK",
+                  style: GoogleFonts.inter(
+                    fontWeight: FontWeight.bold,
+                    color: const Color(0xFF1E3C72),
+                  ),
+                ),
+              )
+            ],
+          ),
+        );
+      }
     }
   }
 

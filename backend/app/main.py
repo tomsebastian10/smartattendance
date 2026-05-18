@@ -4,12 +4,20 @@ from .auth.router import router as auth_router
 from .attendance.router import router as attendance_router
 from .announcements.router import router as announcements_router
 from .services.websocket_manager import manager
+from fastapi.staticfiles import StaticFiles
+import os
 
 app = FastAPI(
     title="Smart Attendance System API",
     description="Multi-factor attendance validation using BLE, GPS, and Dynamic QR.",
     version="1.0.0"
 )
+
+# Ensure uploads directory exists
+os.makedirs("uploads", exist_ok=True)
+
+# Mount static files for uploads
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS Middleware
 app.add_middleware(

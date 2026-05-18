@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:image_picker/image_picker.dart';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import '../../services/api_service.dart';
 
 class LeaveRequestScreen extends StatefulWidget {
@@ -20,7 +21,7 @@ class _LeaveRequestScreenState extends State<LeaveRequestScreen> {
   DateTime _startDate = DateTime.now();
   DateTime _endDate = DateTime.now();
   final TextEditingController _reasonController = TextEditingController();
-  File? _proofImage;
+  XFile? _proofImage;
   bool _isSubmitting = false;
 
   Future<void> _pickImage() async {
@@ -49,7 +50,7 @@ class _LeaveRequestScreenState extends State<LeaveRequestScreen> {
     if (source != null) {
       final picked = await picker.pickImage(source: source, imageQuality: 70);
       if (picked != null) {
-        setState(() => _proofImage = File(picked.path));
+        setState(() => _proofImage = picked);
       }
     }
   }
@@ -59,11 +60,18 @@ class _LeaveRequestScreenState extends State<LeaveRequestScreen> {
 
     setState(() => _isSubmitting = true);
     try {
+      String? documentUrl;
+      if (_proofImage != null) {
+        final bytes = await _proofImage!.readAsBytes();
+        documentUrl = await _apiService.uploadProofBytes(bytes, _proofImage!.name);
+      }
+
       await _apiService.applyLeave({
         "leave_type": _leaveType,
         "start_date": _startDate.toIso8601String().split('T')[0],
         "end_date": _endDate.toIso8601String().split('T')[0],
         "reason": _reasonController.text,
+        "document_url": documentUrl,
       });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -202,16 +210,23 @@ class _LeaveRequestScreenState extends State<LeaveRequestScreen> {
         const SizedBox(height: 12),
         Row(
           children: [
-            Expanded(child: _datePickerCard("From", _startDate, (d) => setState(() => _startDate = d))),
+            Expanded(child: _datePickerCard("From", _startDate, (d) {
+              setState(() {
+                _startDate = d;
+                if (_endDate.isBefore(_startDate)) {
+                  _endDate = _startDate;
+                }
+              });
+            })),
             const SizedBox(width: 16),
-            Expanded(child: _datePickerCard("To", _endDate, (d) => setState(() => _endDate = d))),
+            Expanded(child: _datePickerCard("To", _endDate, (d) => setState(() => _endDate = d), minDate: _startDate)),
           ],
         ),
       ],
     );
   }
 
-  Widget _datePickerCard(String label, DateTime date, Function(DateTime) onPick) {
+  Widget _datePickerCard(String label, DateTime date, Function(DateTime) onPick, {DateTime? minDate}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -219,10 +234,14 @@ class _LeaveRequestScreenState extends State<LeaveRequestScreen> {
         const SizedBox(height: 6),
         GestureDetector(
           onTap: () async {
+            DateTime initial = date;
+            DateTime first = minDate ?? DateTime.now().subtract(const Duration(days: 60));
+            if (initial.isBefore(first)) initial = first;
+            
             final picked = await showDatePicker(
               context: context,
-              initialDate: date,
-              firstDate: DateTime.now(),
+              initialDate: initial,
+              firstDate: first,
               lastDate: DateTime.now().add(const Duration(days: 365)),
             );
             if (picked != null) onPick(picked);
@@ -262,7 +281,9 @@ class _LeaveRequestScreenState extends State<LeaveRequestScreen> {
               children: [
                 ClipRRect(
                   borderRadius: BorderRadius.circular(16),
-                  child: Image.file(_proofImage!, width: double.infinity, fit: BoxFit.cover),
+                  child: kIsWeb 
+                      ? Image.network(_proofImage!.path, width: double.infinity, fit: BoxFit.cover)
+                      : Image.file(File(_proofImage!.path), width: double.infinity, fit: BoxFit.cover),
                 ),
                 Positioned(
                   top: 8, right: 8,

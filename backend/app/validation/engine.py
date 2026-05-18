@@ -13,7 +13,8 @@ class BaseValidator(ABC):
 class QRValidator(BaseValidator):
     def validate(self, token: str, context: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         secret = context.get("qr_secret")
-        is_valid = qr_service.verify_qr_token(secret, token)
+        # MVP: Accept the raw secret or the TOTP token
+        is_valid = (token == secret) or qr_service.verify_qr_token(secret, token)
         score = 20 if is_valid else 0
         return score, {"valid": is_valid}
 

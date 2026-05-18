@@ -22,7 +22,7 @@ class _LoginScreenState extends State<LoginScreen> {
     try {
       // For MVP, we'll use a hardcoded device hash for testing
       // In production, this would be generated from hardware IDs
-      final deviceHash = "test_device_hash_123"; 
+      final deviceHash = "student_device_hash_123"; 
       final response = await _apiService.login(
         _emailController.text.trim(),
         _passwordController.text.trim(),

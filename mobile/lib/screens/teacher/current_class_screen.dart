@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'dart:async';
+import 'dart:convert';
 import '../../services/api_service.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
@@ -36,13 +37,21 @@ class _CurrentClassScreenState extends State<CurrentClassScreen> {
   Future<void> _checkCurrentClass() async {
     try {
       final slot = await _apiService.getCurrentClass();
+      final active = await _apiService.getActiveSession();
       setState(() {
         _currentClass = slot;
+        _activeSession = active;
+        if (active != null) {
+          final qrPayload = {
+            "session_token": active['session_token'],
+            "qr_token": active['qr_secret']
+          };
+          _qrData = jsonEncode(qrPayload);
+        }
         _isLoading = false;
       });
-      if (slot != null) {
-        // If there's an active session in local storage/DB for this teacher, we should fetch it
-        // For simplicity, we'll assume the teacher starts a new one or we fetch active ones
+      if (active != null) {
+        _startRosterUpdates();
       }
     } catch (e) {
       setState(() => _isLoading = false);
@@ -55,14 +64,18 @@ class _CurrentClassScreenState extends State<CurrentClassScreen> {
     setState(() => _isLoading = true);
     try {
       final session = await _apiService.startSession(
-        classroomId: 1, // Placeholder: should be from currentClass
-        subjectId: _currentClass!['id'], // Assuming id is subjectId here
+        classroomId: _currentClass!['classroom_id'] ?? 1,
+        subjectId: _currentClass!['subject_id'] ?? 1,
         durationMins: 60,
       );
       setState(() {
         _activeSession = session;
         _isLoading = false;
-        _qrData = session['qr_secret'];
+        final qrPayload = {
+          "session_token": session['session_token'],
+          "qr_token": session['qr_secret']
+        };
+        _qrData = jsonEncode(qrPayload);
       });
       _startRosterUpdates();
     } catch (e) {

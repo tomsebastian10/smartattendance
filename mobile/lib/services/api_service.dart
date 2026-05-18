@@ -7,53 +7,57 @@ class ApiService {
   final _storage = const FlutterSecureStorage();
 
   Future<Map<String, dynamic>> login(String email, String password, String deviceHash) async {
-    final response = await http.post(
-      Uri.parse(ApiConstants.login),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'email': email,
-        'password': password,
-        'device_hash': deviceHash,
-      }),
-    );
-
+    http.Response response;
     try {
-      final data = jsonDecode(response.body);
-      if (response.statusCode == 200) {
-        await _storage.write(key: 'access_token', value: data['access_token']);
-        return data;
-      } else {
-        throw Exception(data['detail'] ?? 'Login failed');
-      }
+      response = await http.post(
+        Uri.parse(ApiConstants.login),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'email': email,
+          'password': password,
+          'device_hash': deviceHash,
+        }),
+      );
     } catch (e) {
-      throw Exception('Server Error (${response.statusCode}): Make sure the backend is reachable.');
+      throw Exception('Network Error: Make sure the backend server is running and reachable.');
+    }
+
+    final data = jsonDecode(response.body);
+    if (response.statusCode == 200) {
+      await _storage.write(key: 'access_token', value: data['access_token']);
+      return data;
+    } else {
+      throw Exception(data['detail'] ?? 'Login failed');
     }
   }
 
-  Future<Map<String, dynamic>> startSession({required int classroomId, required int subjectId, int durationMins = 60}) async {
+  Future<Map<String, dynamic>> startSession({required int classroomId, required int subjectId, int durationMins = 60, double? lat, double? long}) async {
     final token = await getToken();
-    final response = await http.post(
-      Uri.parse(ApiConstants.startSession),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $token',
-      },
-      body: jsonEncode({
-        'classroom_id': classroomId,
-        'subject_id': subjectId,
-        'duration_mins': durationMins,
-      }),
-    );
-
+    http.Response response;
     try {
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body);
-      } else {
-        final data = jsonDecode(response.body);
-        throw Exception(data['detail'] ?? 'Failed to start session');
-      }
+      response = await http.post(
+        Uri.parse(ApiConstants.startSession),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode({
+          'classroom_id': classroomId,
+          'subject_id': subjectId,
+          'duration_mins': durationMins,
+          if (lat != null) 'lat': lat,
+          if (long != null) 'long': long,
+        }),
+      );
     } catch (e) {
-      throw Exception('Server Error (${response.statusCode}): Could not start session.');
+      throw Exception('Network Error: Make sure the server is reachable.');
+    }
+
+    final data = jsonDecode(response.body);
+    if (response.statusCode == 200) {
+      return data;
+    } else {
+      throw Exception(data['detail'] ?? 'Failed to start session');
     }
   }
 
@@ -66,29 +70,30 @@ class ApiService {
     required String teacherUuid,
   }) async {
     final token = await getToken();
-    final response = await http.post(
-      Uri.parse(ApiConstants.verifyAttendance),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $token',
-      },
-      body: jsonEncode({
-        'session_token': sessionToken,
-        'qr_token': qrToken,
-        'gps_data': {'lat': lat, 'long': long},
-        'ble_data': {'rssi': rssi, 'teacher_uuid': teacherUuid},
-      }),
-    );
-
+    http.Response response;
     try {
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body);
-      } else {
-        final data = jsonDecode(response.body);
-        throw Exception(data['detail'] ?? 'Attendance verification failed');
-      }
+      response = await http.post(
+        Uri.parse(ApiConstants.verifyAttendance),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode({
+          'session_token': sessionToken,
+          'qr_token': qrToken,
+          'gps_data': {'lat': lat, 'long': long},
+          'ble_data': {'rssi': rssi, 'teacher_uuid': teacherUuid},
+        }),
+      );
     } catch (e) {
-      throw Exception('Server Error (${response.statusCode}): Could not verify attendance.');
+      throw Exception('Network Error: Make sure the server is reachable.');
+    }
+
+    final data = jsonDecode(response.body);
+    if (response.statusCode == 200) {
+      return data;
+    } else {
+      throw Exception(data['detail'] ?? 'Attendance verification failed');
     }
   }
 
@@ -143,6 +148,62 @@ class ApiService {
     }
   }
 
+  Future<List<dynamic>> getMyLeaves() async {
+    final token = await getToken();
+    final response = await http.get(
+      Uri.parse('${ApiConstants.baseUrl}/attendance/my-leaves'),
+      headers: {
+        'Authorization': 'Bearer $token',
+      },
+    );
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else {
+      throw Exception('Failed to load my leave requests');
+    }
+  }
+
+  Future<String> uploadProofBytes(List<int> bytes, String fileName) async {
+    final token = await getToken();
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('${ApiConstants.baseUrl}/attendance/upload-proof'),
+    );
+    request.headers['Authorization'] = 'Bearer $token';
+    request.files.add(http.MultipartFile.fromBytes('file', bytes, filename: fileName));
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      return data['document_url'];
+    } else {
+      throw Exception('Failed to upload proof');
+    }
+  }
+
+  Future<String> uploadProof(String filePath) async {
+    final token = await getToken();
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('${ApiConstants.baseUrl}/attendance/upload-proof'),
+    );
+    request.headers['Authorization'] = 'Bearer $token';
+    request.files.add(await http.MultipartFile.fromPath('file', filePath));
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      return data['document_url'];
+    } else {
+      throw Exception('Failed to upload proof');
+    }
+  }
+
   Future<Map<String, dynamic>> getProfile() async {
     final token = await getToken();
     final response = await http.get(
@@ -188,6 +249,19 @@ class ApiService {
     return null;
   }
 
+  Future<Map<String, dynamic>?> getActiveSession() async {
+    final token = await getToken();
+    final response = await http.get(
+      Uri.parse('${ApiConstants.baseUrl}/attendance/active-session'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      if (response.body.isEmpty || response.body == 'null') return null;
+      return jsonDecode(response.body);
+    }
+    return null;
+  }
+
   Future<List<dynamic>> getSessionRoster(int sessionId) async {
     final token = await getToken();
     final response = await http.get(
@@ -214,6 +288,16 @@ class ApiService {
       headers: {'Authorization': 'Bearer $token'},
     );
     if (response.statusCode != 200) throw Exception('Failed to end session');
+  }
+
+  Future<List<dynamic>> getFacultySessionHistory() async {
+    final token = await getToken();
+    final response = await http.get(
+      Uri.parse('${ApiConstants.baseUrl}/attendance/faculty-session-history'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) return jsonDecode(response.body);
+    throw Exception('Failed to load session history');
   }
 
   // --- HOD Leave Management ---
@@ -267,6 +351,35 @@ class ApiService {
     );
     if (response.statusCode == 200) return jsonDecode(response.body);
     throw Exception('Failed to load announcements');
+  }
+
+  Future<String> uploadAnnouncementImage(String filePath) async {
+    final token = await getToken();
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('${ApiConstants.baseUrl}/announcements/upload-image'),
+    );
+    request.headers['Authorization'] = 'Bearer $token';
+    request.files.add(await http.MultipartFile.fromPath('file', filePath));
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      return data['image_url'];
+    } else {
+      throw Exception('Failed to upload image');
+    }
+  }
+
+  Future<void> deleteAnnouncement(int id) async {
+    final token = await getToken();
+    final response = await http.delete(
+      Uri.parse('${ApiConstants.baseUrl}/announcements/$id'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode != 200) throw Exception('Failed to delete announcement');
   }
 
   Future<void> logout() async {

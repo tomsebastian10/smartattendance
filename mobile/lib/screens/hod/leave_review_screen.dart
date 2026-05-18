@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import '../../services/api_service.dart';
+import '../../utils/constants.dart';
 
 class LeaveReviewScreen extends StatefulWidget {
   const LeaveReviewScreen({super.key});
@@ -134,6 +135,76 @@ class _LeaveReviewScreenState extends State<LeaveReviewScreen> {
           ),
           const SizedBox(height: 8),
           Text(req['reason'] ?? "No reason provided", style: GoogleFonts.inter(fontSize: 14, color: Colors.black87)),
+          if (req['document_url'] != null && req['document_url'].toString().isNotEmpty) ...[
+            const SizedBox(height: 16),
+            InkWell(
+              onTap: () {
+                showDialog(
+                  context: context,
+                  builder: (ctx) => Dialog(
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        AppBar(
+                          title: Text("Document Proof", style: GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 16)),
+                          backgroundColor: Colors.white,
+                          elevation: 0,
+                          centerTitle: true,
+                          leading: IconButton(
+                            icon: const Icon(Icons.close, color: Colors.black),
+                            onPressed: () => Navigator.pop(ctx),
+                          ),
+                        ),
+                        Flexible(
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(12),
+                              child: Image.network(
+                                '${ApiConstants.baseUrl.replaceAll('/api/v1', '')}${req['document_url']}',
+                                errorBuilder: (context, error, stackTrace) => Container(
+                                  padding: const EdgeInsets.all(32),
+                                  color: Colors.grey[100],
+                                  child: const Center(
+                                    child: Icon(Icons.broken_image, size: 48, color: Colors.grey),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E3C72).withOpacity(0.05),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFF1E3C72).withOpacity(0.15)),
+                ),
+                child: Row(
+                  children: [
+                    const FaIcon(FontAwesomeIcons.fileImage, size: 16, color: Color(0xFF1E3C72)),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text("Medical/OD Certificate", style: GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 13, color: const Color(0xFF1E3C72))),
+                          Text("Tap to view attached proof document", style: GoogleFonts.inter(fontSize: 11, color: Colors.grey[600])),
+                        ],
+                      ),
+                    ),
+                    const Icon(Icons.open_in_new, size: 16, color: Color(0xFF1E3C72)),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 20),
           Row(
             children: [

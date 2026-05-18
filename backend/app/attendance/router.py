@@ -1,17 +1,19 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 import uuid
 import secrets
+import os
+import shutil
 from ..database import get_db
 from ..models.user import User, UserRole
 from ..models.attendance import AttendanceSession, AttendanceRecord, SessionState, AttendanceStatus
 from ..schemas.attendance import SessionCreate, SessionResponse, AttendanceVerify, AttendanceResult
 from ..auth.dependencies import get_current_faculty, get_current_user, get_current_hod
 from ..qr.service import qr_service
-from ..schemas.academic import StudentDashboardStats, AttendanceStats, TimetableSlotResponse, LeaveRequestCreate, LeaveRequestResponse, StudentRosterItem
+from ..schemas.academic import StudentDashboardStats, AttendanceStats, TimetableSlotResponse, LeaveRequestCreate, LeaveRequestResponse, StudentRosterItem, FacultySessionHistoryItem
 from ..models.academic import Subject, Enrollment, TimetableSlot, LeaveRequest, LeaveStatus, LeaveType
 from ..gps.service import gps_service
 from ..ble.service import ble_service
@@ -78,10 +80,42 @@ def get_student_stats(
         needed = int((0.75 * total_classes - total_present) / 0.25) if total_classes > 0 else 0
         prediction = f"You need to attend approximately {max(0, needed)} more classes to reach 75%."
 
+    # Dynamic historic attendance trend calculation
+    enrolled_subject_ids = [e.subject_id for e in enrollments]
+    sessions = db.query(AttendanceSession).filter(
+        AttendanceSession.subject_id.in_(enrolled_subject_ids)
+    ).order_by(AttendanceSession.started_at.asc()).all()
+    
+    records = db.query(AttendanceRecord).filter(
+        AttendanceRecord.student_id == current_user.id
+    ).all()
+    
+    record_status = {r.session_id: r.status for r in records}
+    
+    attendance_trend = []
+    total_conducted = 0
+    total_present_so_far = 0
+    
+    for s in sessions:
+        total_conducted += 1
+        status = record_status.get(s.id, AttendanceStatus.ABSENT)
+        if status == AttendanceStatus.PRESENT:
+            total_present_so_far += 1
+        percentage = (total_present_so_far / total_conducted * 100.0)
+        attendance_trend.append(round(percentage, 2))
+        
+    if not attendance_trend:
+        attendance_trend = [100.0]
+    if len(attendance_trend) == 1:
+        attendance_trend = [attendance_trend[0], attendance_trend[0]]
+    if len(attendance_trend) > 10:
+        attendance_trend = attendance_trend[-10:]
+
     return StudentDashboardStats(
         overall_attendance=round(overall_percentage, 2),
         subject_stats=subject_stats,
-        prediction=prediction
+        prediction=prediction,
+        attendance_trend=attendance_trend
     )
 
 @router.get("/timetable", response_model=List[TimetableSlotResponse])
@@ -102,6 +136,8 @@ def get_timetable(
             id=slot.id,
             subject_name=slot.subject.name,
             subject_code=slot.subject.code,
+            subject_id=slot.subject_id,
+            classroom_id=slot.classroom_id,
             day_of_week=slot.day_of_week,
             start_time=slot.start_time,
             end_time=slot.end_time,
@@ -128,6 +164,39 @@ def apply_leave(
     db.refresh(new_request)
     return new_request
 
+@router.get("/my-leaves", response_model=List[LeaveRequestResponse])
+def get_student_leaves(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    requests = db.query(LeaveRequest).filter(
+        LeaveRequest.student_id == current_user.id
+    ).order_by(LeaveRequest.created_at.desc()).all()
+    
+    for req in requests:
+        req.student_name = current_user.name
+    return requests
+
+@router.post("/upload-proof")
+def upload_proof(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    # Ensure static uploads dir exists
+    os.makedirs("uploads", exist_ok=True)
+    
+    # Generate unique filename to avoid naming conflicts
+    ext = os.path.splitext(file.filename)[1]
+    filename = f"proof_{uuid.uuid4()}{ext}"
+    filepath = os.path.join("uploads", filename)
+    
+    # Save the file
+    with open(filepath, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # Return the static URL path
+    return {"document_url": f"/uploads/{filename}"}
+
 @router.post("/start-session", response_model=SessionResponse)
 def start_session(
     session_in: SessionCreate, 
@@ -140,16 +209,27 @@ def start_session(
     ble_uuid = str(uuid.uuid4())
     
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=session_in.duration_mins)
+
+    # Safety fallback: if the requested classroom_id doesn't exist, use the first available one
+    classroom_id = session_in.classroom_id
+    classroom = db.query(Classroom).filter(Classroom.id == classroom_id).first()
+    if not classroom:
+        classroom = db.query(Classroom).first()
+        if not classroom:
+            raise HTTPException(status_code=400, detail="No classrooms found in the database. Please seed the database.")
+        classroom_id = classroom.id
     
     new_session = AttendanceSession(
         faculty_id=current_faculty.id,
-        classroom_id=session_in.classroom_id,
-        subject_id=session_in.subject_id, # Link session to subject
+        classroom_id=classroom_id,
+        subject_id=session_in.subject_id,
         session_token=session_token,
         qr_secret=qr_secret,
         ble_uuid=ble_uuid,
         state=SessionState.ACTIVE,
-        expires_at=expires_at
+        expires_at=expires_at,
+        faculty_lat=session_in.lat,
+        faculty_long=session_in.long
     )
     
     db.add(new_session)
@@ -157,6 +237,18 @@ def start_session(
     db.refresh(new_session)
     
     return new_session
+
+@router.get("/active-session", response_model=Optional[SessionResponse])
+def get_active_session(
+    db: Session = Depends(get_db),
+    current_faculty: User = Depends(get_current_faculty)
+):
+    # Find any currently active session started by this faculty
+    session = db.query(AttendanceSession).filter(
+        AttendanceSession.faculty_id == current_faculty.id,
+        AttendanceSession.state == SessionState.ACTIVE
+    ).first()
+    return session
 
 @router.post("/verify", response_model=AttendanceResult)
 def verify_attendance(
@@ -181,10 +273,14 @@ def verify_attendance(
     # 3. Validation Logic (Modular Engine)
     classroom = db.query(Classroom).filter(Classroom.id == session.classroom_id).first()
     
+    # Use Teacher's live location if available, otherwise fallback to Classroom DB location
+    target_lat = session.faculty_lat if session.faculty_lat is not None else (classroom.gps_lat if classroom else 0)
+    target_long = session.faculty_long if session.faculty_long is not None else (classroom.gps_long if classroom else 0)
+    
     context = {
         "qr_secret": session.qr_secret,
-        "lat": classroom.gps_lat if classroom else 0,
-        "long": classroom.gps_long if classroom else 0,
+        "lat": target_lat,
+        "long": target_long,
         "radius": classroom.gps_radius_meters if classroom else 200,
         "ble_uuid": session.ble_uuid
     }
@@ -200,8 +296,12 @@ def verify_attendance(
     total_score = validation_result["total_score"]
     breakdown = validation_result["breakdown"]
 
-    # 4. Status Determination (Threshold 80)
-    if total_score >= 80:
+    # 4. Status Determination
+    # QR valid (20) + device trust (10) = 30 minimum for a valid QR scan.
+    # GPS/BLE add bonus points but are not required for MVP.
+    qr_score = breakdown["qr"]["score"]
+    if qr_score > 0 and total_score >= 25:
+        # Valid QR scan → always PRESENT
         status_result = AttendanceStatus.PRESENT
     elif total_score >= 50:
         status_result = AttendanceStatus.FLAGGED
@@ -273,6 +373,8 @@ def get_faculty_timetable(
             id=slot.id,
             subject_name=slot.subject.name,
             subject_code=slot.subject.code,
+            subject_id=slot.subject_id,
+            classroom_id=slot.classroom_id,
             day_of_week=slot.day_of_week,
             start_time=slot.start_time,
             end_time=slot.end_time,
@@ -303,6 +405,8 @@ def get_current_class(
         id=slot.id,
         subject_name=slot.subject.name,
         subject_code=slot.subject.code,
+        subject_id=slot.subject_id,
+        classroom_id=slot.classroom_id,
         day_of_week=slot.day_of_week,
         start_time=slot.start_time,
         end_time=slot.end_time,
@@ -364,6 +468,9 @@ def mark_student_present(
         )
         db.add(record)
     
+    # Mark in Redis to prevent future QR scanning duplicates
+    redis_service.mark_attendance_processed(session_id, student_id)
+    
     db.commit()
     return {"status": "success"}
 
@@ -376,7 +483,7 @@ def end_session(
     session = db.query(AttendanceSession).filter(AttendanceSession.id == session_id).first()
     if not session: raise HTTPException(status_code=404, detail="Session not found")
     
-    session.state = SessionState.COMPLETED
+    session.state = SessionState.TERMINATED
     
     # Auto-insert ABSENT for no-shows
     enrolled_student_ids = [e.student_id for e in db.query(Enrollment).filter(Enrollment.subject_id == session.subject_id).all()]
@@ -394,6 +501,47 @@ def end_session(
     
     db.commit()
     return {"status": "session_ended"}
+
+@router.get("/faculty-session-history", response_model=List[FacultySessionHistoryItem])
+def get_faculty_session_history(
+    db: Session = Depends(get_db),
+    current_faculty: User = Depends(get_current_faculty)
+):
+    sessions = db.query(AttendanceSession).filter(
+        AttendanceSession.faculty_id == current_faculty.id
+    ).order_by(AttendanceSession.started_at.desc()).all()
+    
+    result = []
+    for s in sessions:
+        enrolled_count = db.query(Enrollment).filter(Enrollment.subject_id == s.subject_id).count()
+        
+        present_count = db.query(AttendanceRecord).filter(
+            AttendanceRecord.session_id == s.id,
+            AttendanceRecord.status == AttendanceStatus.PRESENT
+        ).count()
+        
+        absent_count = max(0, enrolled_count - present_count)
+        
+        duration_mins = 60
+        if s.expires_at and s.started_at:
+            delta = s.expires_at - s.started_at
+            duration_mins = int(delta.total_seconds() / 60)
+            
+        classroom = db.query(Classroom).filter(Classroom.id == s.classroom_id).first()
+        
+        result.append(FacultySessionHistoryItem(
+            id=s.id,
+            subject_name=s.subject.name if s.subject else "Unknown",
+            subject_code=s.subject.code if s.subject else "N/A",
+            room_name=classroom.room_name if classroom else "Unknown",
+            date=s.started_at.strftime("%Y-%m-%d") if s.started_at else "",
+            start_time=s.started_at.strftime("%H:%M") if s.started_at else "",
+            duration_mins=duration_mins,
+            present_count=present_count,
+            absent_count=absent_count,
+            state=s.state.value
+        ))
+    return result
 
 @router.get("/leave-requests", response_model=List[LeaveRequestResponse])
 def get_hod_leave_requests(
@@ -423,8 +571,8 @@ def approve_leave_request(
     
     # BACKFILL ATTENDANCE
     sessions = db.query(AttendanceSession).filter(
-        func.date(AttendanceSession.created_at) >= request.start_date,
-        func.date(AttendanceSession.created_at) <= request.end_date
+        func.date(AttendanceSession.started_at) >= request.start_date,
+        func.date(AttendanceSession.started_at) <= request.end_date
     ).all()
     
     for session in sessions:

@@ -28,11 +28,14 @@ class StudentDashboardStats(BaseModel):
     overall_attendance: float
     subject_stats: List[AttendanceStats]
     prediction: str # Message about how many classes to attend
+    attendance_trend: List[float] = []
 
 class TimetableSlotResponse(BaseModel):
     id: int
     subject_name: str
     subject_code: str
+    subject_id: int
+    classroom_id: int
     day_of_week: int
     start_time: time
     end_time: time
@@ -55,6 +58,7 @@ class LeaveRequestResponse(BaseModel):
     end_date: date
     status: LeaveStatus
     reason: str
+    document_url: Optional[str] = None
     created_at: datetime
     class Config:
         from_attributes = True
@@ -68,11 +72,27 @@ class AnnouncementBase(BaseModel):
     title: str
     body: str
     target_subject_id: Optional[int] = None
+    target_role: Optional[str] = None
     is_global: bool = False
+    image_url: Optional[str] = None
 
 class AnnouncementResponse(AnnouncementBase):
     id: int
     author_name: str
     created_at: datetime
+    class Config:
+        from_attributes = True
+
+class FacultySessionHistoryItem(BaseModel):
+    id: int
+    subject_name: str
+    subject_code: str
+    room_name: str
+    date: str
+    start_time: str
+    duration_mins: int
+    present_count: int
+    absent_count: int
+    state: str
     class Config:
         from_attributes = True

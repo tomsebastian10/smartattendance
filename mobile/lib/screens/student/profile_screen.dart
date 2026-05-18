@@ -19,6 +19,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool _isLoading = true;
   bool _isSaving = false;
   Map<String, dynamic>? _userInfo;
+  List<dynamic> _myLeaves = [];
 
   @override
   void initState() {
@@ -29,8 +30,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Future<void> _loadProfile() async {
     try {
       final info = await _apiService.getProfile();
+      final leaves = await _apiService.getMyLeaves();
       setState(() {
         _userInfo = info;
+        _myLeaves = leaves;
         _nameController.text = info['name'] ?? '';
         _isLoading = false;
       });
@@ -86,6 +89,96 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
+  int get _notificationCount => _myLeaves.where((l) => l['status'] != 'PENDING').length;
+
+  void _showNotificationsDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        final resolvedLeaves = _myLeaves.where((l) => l['status'] != 'PENDING').toList();
+        
+        return AlertDialog(
+          title: Row(
+            children: [
+              const FaIcon(FontAwesomeIcons.solidBell, color: Color(0xFF1E3C72), size: 20),
+              const SizedBox(width: 10),
+              Text("Notifications", style: GoogleFonts.inter(fontWeight: FontWeight.bold)),
+            ],
+          ),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: resolvedLeaves.isEmpty
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(height: 20),
+                      FaIcon(FontAwesomeIcons.bellSlash, size: 40, color: Colors.grey[300]),
+                      const SizedBox(height: 16),
+                      Text("No new updates on your leaves", style: GoogleFonts.inter(color: Colors.grey, fontSize: 14)),
+                      const SizedBox(height: 20),
+                    ],
+                  )
+                : ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: resolvedLeaves.length,
+                    itemBuilder: (context, index) {
+                      final leaf = resolvedLeaves[index];
+                      final bool isApproved = leaf['status'] == 'APPROVED';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: (isApproved ? Colors.green : Colors.red).withOpacity(0.05),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: (isApproved ? Colors.green : Colors.red).withOpacity(0.15)),
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            CircleAvatar(
+                              backgroundColor: (isApproved ? Colors.green : Colors.red).withOpacity(0.1),
+                              radius: 16,
+                              child: FaIcon(
+                                isApproved ? FontAwesomeIcons.circleCheck : FontAwesomeIcons.circleXmark,
+                                color: isApproved ? Colors.green : Colors.red,
+                                size: 16,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    isApproved ? "Leave Request Approved!" : "Leave Request Rejected",
+                                    style: GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 13, color: isApproved ? Colors.green[800] : Colors.red[800]),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    "Your ${leaf['leave_type'].toString().toLowerCase().replaceAll('_', ' ')} request for ${leaf['start_date']} has been ${leaf['status'].toString().toLowerCase()}.",
+                                    style: GoogleFonts.inter(fontSize: 12, color: Colors.grey[700], height: 1.3),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text("Dismiss", style: GoogleFonts.inter(fontWeight: FontWeight.bold, color: const Color(0xFF1E3C72))),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -95,6 +188,33 @@ class _ProfileScreenState extends State<ProfileScreen> {
         backgroundColor: Colors.white,
         elevation: 0,
         centerTitle: true,
+        actions: [
+          Stack(
+            alignment: Alignment.center,
+            children: [
+              IconButton(
+                icon: const FaIcon(FontAwesomeIcons.bell, color: Color(0xFF1E3C72)),
+                onPressed: _showNotificationsDialog,
+              ),
+              if (_notificationCount > 0)
+                Positioned(
+                  right: 8,
+                  top: 8,
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                    constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+                    child: Text(
+                      '$_notificationCount',
+                      style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
